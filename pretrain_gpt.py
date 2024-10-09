@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain GPT."""
-
+import copy
 import os
 import torch
 from functools import partial
@@ -34,8 +34,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 
+# FIXME: debug remove
+import sentencepiece as spm
 
 stimer = StragglerDetector()
+
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
@@ -68,14 +71,17 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             pre_process=pre_process,
             post_process=post_process,
         )
-    else: # using core models
+    else:  # using core models
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
             if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm, args.fp8)
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts,
+                                                                                    args.moe_grouped_gemm,
+                                                                                    args.qk_layernorm, args.fp8)
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm,
+                                                                  args.qk_layernorm)
 
         build_model_context = nullcontext
         build_model_context_args = {}
@@ -90,7 +96,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
                     build_model_context_args["preserve_high_precision_init_val"] = True
             except:
-                raise RuntimeError("--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found.")
+                raise RuntimeError(
+                    "--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found.")
 
         with build_model_context(**build_model_context_args):
             model = GPTModel(
@@ -143,8 +150,12 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     args = get_args()
 
     losses = output_tensor.float()
+
     loss_mask = loss_mask.view(-1).float()
+    # print("Loss mask: ", loss_mask)
+
     total_tokens = loss_mask.sum()
+
     loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
 
     if args.context_parallel_size > 1:
@@ -192,13 +203,45 @@ def forward_step(data_iterator, model: GPTModel):
         output_tensor = model(tokens, position_ids, attention_mask,
                               labels=labels)
 
+    # FIXME: debug
+    # tokenizer = get_tokenizer()
+    # tokens_to_print = copy.deepcopy(tokens)
+    # tokens_to_print = tokens_to_print.tolist()
+
+    # filtered_list = [x for x in tokens_to_print if x != 131076 and x != 0]
+    #
+    # # Partition the list at 131074 (unless it is the last element)
+    # result = []
+    # current_partition = []
+    #
+    # for i, num in enumerate(filtered_list):
+    #     if num == 131074 and i != len(filtered_list) - 1:
+    #         if current_partition:
+    #             result.append(current_partition)
+    #         current_partition = []
+    #     current_partition.append(num)
+    #
+    # # Append the last partition if it's not empty
+    # if current_partition:
+    #     result.append(current_partition)
+    #
+    # out_string = ""
+    # for part in current_partition:
+    #     out_string += tokenizer.detokenize(part)
+    #     out_string += " <EOD> "
+
+    # print("Input tokens:", tokens)
+    # print("Detokenized:", out_string)
+    # print("Loss mask:", loss_mask)
+    # print("Position_ids:", position_ids)
+
     return output_tensor, partial(loss_func, loss_mask)
 
 
 def is_dataset_built_on_rank():
     return (
-        mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
-    ) and mpu.get_tensor_model_parallel_rank() == 0
+                   mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
+           ) and mpu.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -223,7 +266,7 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
-        s3_cache_path = args.s3_cache_path
+        s3_cache_path=args.s3_cache_path
     )
 
 
@@ -257,7 +300,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
-
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 

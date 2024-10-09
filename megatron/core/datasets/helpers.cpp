@@ -139,7 +139,7 @@ void build_blending_indices(py::array_t<int16_t> &dataset_index,
   }
 }
 
-py::array build_sample_idx(const py::array_t<int32_t> &sizes_,
+py::array build_sample_idx_old(const py::array_t<int32_t> &sizes_,
                            const py::array_t<int32_t> &doc_idx_,
                            const int32_t seq_length,
                            const int32_t num_epochs,
@@ -174,6 +174,9 @@ py::array build_sample_idx(const py::array_t<int32_t> &sizes_,
   }
   int64_t *sample_idx = new int64_t[2 * (num_samples + 1)];
 
+
+
+  int64_t flag = 0;
   // Index into sample_idx.
   int64_t sample_index = 0;
   // Index into doc_idx.
@@ -196,18 +199,41 @@ py::array build_sample_idx(const py::array_t<int32_t> &sizes_,
       auto doc_length = sizes[doc_id] - doc_offset;
       // And add it to the current sequence.
       remaining_seq_length -= doc_length;
+
+      // handle too long samples?
+//      if (doc_length > seq_length){
+//        ++doc_idx_index;
+//        break;
+//      }
+
       // If we have more than a full sequence, adjust offset and set
       // remaining length to zero so we return from the while loop.
       // Note that -1 here is for the same reason we have -1 in
       // `_num_epochs` calculations.
-      if (remaining_seq_length <= 0)
+
+      // TODO: instruct loading:
+      // we have exactly full sequence, break
+      if (remaining_seq_length == 0){
+        doc_offset = 0;
+        ++doc_idx_index;
+        break;
+      }
+
+      // TODO: instruct loading:
+      // if we have more than full sequence then revert any excess and finalize the sample
+
+      if (remaining_seq_length < 0)
       {
-        doc_offset += (remaining_seq_length + doc_length - add_extra_token_to_sequence);
+//        doc_offset += (remaining_seq_length + doc_length - add_extra_token_to_sequence);
+//        remaining_seq_length = 0;
+        doc_offset = doc_length;
+        flag = 1;
         remaining_seq_length = 0;
+
       }
       else
       {
-        // Otherwise, start from the begining of the next document.
+        // Otherwise, start from the beginning of the next document.
         if (doc_idx_index == (doc_idx_.shape(0) - 1))
         {
           // If we have reached the end of the documents, break.
@@ -220,9 +246,18 @@ py::array build_sample_idx(const py::array_t<int32_t> &sizes_,
       }
     }
     // Record the sequence.
-    sample_idx[2 * sample_index] = doc_idx_index;
-    sample_idx[2 * sample_index + 1] = doc_offset;
-    ++sample_index;
+    if (flag == 1){
+        sample_idx[2 * sample_index] = doc_idx_index-1;
+        sample_idx[2 * sample_index + 1] = doc_offset;
+        ++sample_index;
+        flag = 0;
+        doc_offset = 0;
+    }
+    else {
+        sample_idx[2 * sample_index] = doc_idx_index;
+        sample_idx[2 * sample_index + 1] = doc_offset;
+        ++sample_index;
+    }
   }
 
   // Method to deallocate memory.
@@ -238,6 +273,472 @@ py::array build_sample_idx(const py::array_t<int32_t> &sizes_,
                    sample_idx,                               // the data pointer
                    free_when_done);                          // numpy array references
 }
+
+
+py::array build_sample_idx(const py::array_t<int32_t> &sizes_,
+                           const py::array_t<int32_t> &doc_idx_,
+                           const int32_t seq_length,
+                           const int32_t num_epochs,
+                           const int64_t tokens_per_epoch,
+                           const bool drop_last_partial_sequence = true,
+                           const int add_extra_token_to_sequence = 1)
+{
+  /* Sample index (sample_idx) is used for gpt2 like dataset for which
+     the documents are flattened and the samples are built based on this
+     1-D flatten array. It is a 2D array with sizes [number-of-samples + 1, 2]
+     where [..., 0] contains the index into `doc_idx` and [..., 1] is the
+     starting offset in that document.*/
+
+  // Consistency checks.
+  assert(seq_length > 1);
+  assert(num_epochs > 0);
+  assert(tokens_per_epoch > 1);
+
+  // Remove bound checks.
+  auto sizes = sizes_.unchecked<1>();
+  auto doc_idx = doc_idx_.unchecked<1>();
+
+  // Mapping and it's length (1D).
+  int64_t num_samples = 0;
+  if (drop_last_partial_sequence == true)
+  {
+    num_samples = (num_epochs * tokens_per_epoch - add_extra_token_to_sequence) / seq_length;
+  }
+  else
+  {
+    num_samples = ceil(float(num_epochs * tokens_per_epoch - add_extra_token_to_sequence) / seq_length);
+  }
+
+  // how many tokens should we see, excluding padding
+//  int64_t num_tokens = num_epochs * tokens_per_epoch;
+  int64_t num_tokens = num_samples * seq_length;
+  std::cout << "Num_samples: " << num_samples << std::endl;
+
+
+  // first pass
+
+  // how many tokens have we sampled so far, excluding padding
+  int64_t total_tokens = 0;
+
+  // Index into sample_idx.
+  int64_t sample_index = 0;
+  // Index into doc_idx.
+  int64_t doc_idx_index = 0;
+
+
+  // calculate number of samples
+  while (total_tokens <= num_tokens)
+  {
+    // Start with a fresh sequence.
+    int32_t remaining_seq_length = seq_length; // + add_extra_token_to_sequence;
+
+    // set the start document idx
+    int64_t start_doc_idx = doc_idx_index;
+
+    while (remaining_seq_length != 0)
+    {
+
+      // check for reaching end of document array
+      if (doc_idx_index == (doc_idx_.shape(0) - 1))
+        {
+
+        // If we have reached the end of the documents, reset
+        doc_idx_index = 0;
+        int64_t temp_len = seq_length - remaining_seq_length;
+        total_tokens += temp_len;
+        // move the sample pointer forward
+        ++sample_index;
+
+
+        break;
+
+        }
+      // Get the document length.
+      auto doc_id = doc_idx[doc_idx_index];
+      auto doc_length = sizes[doc_id]; // - doc_offset;
+
+      if (doc_length > seq_length)
+      {
+        ++doc_idx_index;
+        break;
+      }
+
+
+      // And add it to the current sequence.
+      remaining_seq_length -= doc_length;
+//      std::cout << "Document idx: " << doc_idx_index << ", length = " << doc_length << std::endl;;
+      // handle too long samples?
+//      if (doc_length > seq_length){
+//        ++doc_idx_index;
+//        break;
+//      }
+
+      // If we have more than a full sequence, adjust offset and set
+      // remaining length to zero so we return from the while loop.
+      // Note that -1 here is for the same reason we have -1 in
+      // `_num_epochs` calculations.
+
+      // TODO: instruct loading:
+      // we have exactly full sequence, break
+      if (remaining_seq_length == 0){
+
+//        // record the sample
+//        sample_idx[2 * sample_index] = start_doc_idx;
+//        sample_idx[2 * sample_index + 1] = doc_idx_index;
+////        sample_idx[3 * sample_index + 2] = seq_length - remaining_seq_length;
+//
+        int64_t temp_len = seq_length - remaining_seq_length;
+//
+        // count useful tokens
+        total_tokens += temp_len;
+//        std::cout << "Sampled tokens: " << temp_len << std::endl;
+//        // **Debugging Print Statement**
+        std::cout << "Sample " << sample_index << ": start_doc_idx = " << start_doc_idx
+                  << ", end_doc_idx = " << doc_idx_index
+                  << ", sample_length = " << temp_len << ", tokens = " << total_tokens << "/" << num_tokens << std::endl;
+
+        // move the document pointer forward
+        ++doc_idx_index;
+        // move the sample pointer forward
+        ++sample_index;
+        break;
+      }
+
+      // we have exceeded the length with current document
+      // finalize the sample
+      if (remaining_seq_length < 0){
+
+        // record the sample
+//        sample_idx[2 * sample_index] = start_doc_idx;
+//        sample_idx[2 * sample_index + 1] = doc_idx_index - 1;
+//        sample_idx[3 * sample_index + 2] = seq_length - remaining_seq_length - doc_length;
+
+        int64_t temp_idx = doc_idx_index - 1;
+        int64_t temp_len = seq_length - remaining_seq_length - doc_length;
+
+        // count useful tokens
+        total_tokens += temp_len;
+//        std::cout << "Sampled tokens: " << temp_len << std::endl;
+
+//        // **Debugging Print Statement**
+        std::cout << "Sample " << sample_index << ": start_doc_idx = " << start_doc_idx
+                  << ", end_doc_idx = " << temp_idx
+                  << ", sample_length = " << temp_len << ", tokens = " << total_tokens << "/" << num_tokens << std::endl;
+
+        // do not move the document pointer forward
+
+        // move the sample pointer forward
+        ++sample_index;
+        break;
+
+      }
+      else
+      {
+//        // Otherwise, start from the beginning of the next document.
+//        if (doc_idx_index == (doc_idx_.shape(0) - 1))
+//        {
+//          // If we have reached the end of the documents, break.
+//          assert(sample_index == num_samples);
+//          doc_offset = sizes[doc_idx[doc_idx_index]] - add_extra_token_to_sequence;
+//          break;
+//        }
+
+        ++doc_idx_index;
+      }
+    }
+  }
+
+
+  std::cout << "Succesfully completed first pass: num_sample calculation!" << std::endl;
+  // how many tokens have we sampled so far, excluding padding
+  total_tokens = 0;
+
+  // this is actuallly [number-of-samples + 1, 2]
+  // where [..., 0] contains the index into start 'doc_idx', [...,1] contains the idx into the end 'doc_idx'
+  // and [...,2] is the sample length
+//  int64_t *sample_idx = new int64_t[2 * (sample_index + 1)];
+  int64_t total_samples = sample_index;
+  int64_t *sample_idx = new int64_t[2 * total_samples];
+
+
+  // Index into sample_idx.
+  sample_index = 0;
+  // Index into doc_idx.
+  doc_idx_index = 0;
+
+  // second pass
+  // populate the sample index
+
+
+  while (total_tokens <= num_tokens)
+  {
+
+    // Start with a fresh sequence.
+    int32_t remaining_seq_length = seq_length; // + add_extra_token_to_sequence;
+
+    // set the start document idx
+    int64_t start_doc_idx = doc_idx_index;
+
+    while (remaining_seq_length != 0)
+    {
+
+      // check for reaching end of document array
+      if (doc_idx_index == (doc_idx_.shape(0) - 1))
+        {
+
+        // Finalize the current sample, however full it is
+        sample_idx[2 * sample_index] = start_doc_idx;
+        sample_idx[2 * sample_index + 1] = doc_idx_index;
+
+        int64_t temp_len = seq_length - remaining_seq_length;
+
+        // count useful tokens
+        total_tokens += temp_len;
+
+        // If we have reached the end of the documents, reset
+        doc_idx_index = 0;
+
+        // move the sample pointer forward
+        ++sample_index;
+
+        break;
+
+        }
+
+
+      // Get the document length.
+      auto doc_id = doc_idx[doc_idx_index];
+      auto doc_length = sizes[doc_id]; // - doc_offset;
+
+      if (doc_length > seq_length)
+      {
+        ++doc_idx_index;
+        break;
+      }
+      // And add it to the current sequence.
+      remaining_seq_length -= doc_length;
+      // **Debugging Print Statement**
+//      std::cout << "Document idx: " << doc_idx_index << ", length = " << doc_length << std::endl;;
+      // handle too long samples?
+//      if (doc_length > seq_length){
+//        ++doc_idx_index;
+//        break;
+//      }
+
+      // If we have more than a full sequence, adjust offset and set
+      // remaining length to zero so we return from the while loop.
+      // Note that -1 here is for the same reason we have -1 in
+      // `_num_epochs` calculations.
+
+      // TODO: instruct loading:
+      // we have exactly full sequence, break
+      if (remaining_seq_length == 0){
+
+        // record the sample
+        sample_idx[2 * sample_index] = start_doc_idx;
+        sample_idx[2 * sample_index + 1] = doc_idx_index;
+//        sample_idx[3 * sample_index + 2] = seq_length - remaining_seq_length;
+
+        int64_t temp_len = seq_length - remaining_seq_length;
+
+        // count useful tokens
+        total_tokens += temp_len;
+        // **Debugging Print Statement**
+//        std::cout << "Sample " << sample_index << ": start_doc_idx = " << start_doc_idx
+//                  << ", end_doc_idx = " << doc_idx_index
+//                  << ", sample_length = " << temp_len << std::endl;
+
+        // move the document pointer forward
+        ++doc_idx_index;
+        // move the sample pointer forward
+        ++sample_index;
+        break;
+      }
+
+      // we have exceeded the length with current document
+      // finalize the sample
+      if (remaining_seq_length < 0){
+
+        // record the sample
+        sample_idx[2 * sample_index] = start_doc_idx;
+        sample_idx[2 * sample_index + 1] = doc_idx_index - 1;
+//        sample_idx[3 * sample_index + 2] = seq_length - remaining_seq_length - doc_length;
+
+        int64_t temp_idx = doc_idx_index - 1;
+        int64_t temp_len = seq_length - remaining_seq_length - doc_length;
+
+        // count useful tokens
+        total_tokens += temp_len;
+
+        // **Debugging Print Statement**
+//        std::cout << "Sample " << sample_index << ": start_doc_idx = " << start_doc_idx
+//                  << ", end_doc_idx = " << temp_idx
+//                  << ", sample_length = " << temp_len << std::endl;
+
+        // do not move the document pointer forward
+
+        // move the sample pointer forward
+        ++sample_index;
+        break;
+
+      }
+      else
+      {
+//        // Otherwise, start from the beginning of the next document.
+//        if (doc_idx_index == (doc_idx_.shape(0) - 1))
+//        {
+//          // If we have reached the end of the documents, break.
+//          assert(sample_index == num_samples);
+//          doc_offset = sizes[doc_idx[doc_idx_index]] - add_extra_token_to_sequence;
+//          break;
+//        }
+
+        ++doc_idx_index;
+ // FIXME: prolly uncomment this
+//        if (doc_idx_index == (doc_idx_.shape(0) - 1))
+//        {
+//          // If we have reached the end of the documents, reset
+//          doc_idx_index = 0;
+//        }
+      }
+    }
+  }
+
+  std::cout << "Succesfully completed second pass: sample array population!" << std::endl;
+
+  // Method to deallocate memory.
+  py::capsule free_when_done(sample_idx, [](void *mem_)
+                             {
+	int64_t *mem = reinterpret_cast<int64_t*>(mem_);
+	delete[] mem; });
+
+  // Return the numpy array.
+  const auto byte_size = sizeof(int64_t);
+  return py::array(std::vector<int64_t>{num_samples + 1, 2}, // shape
+                   {2 * byte_size, byte_size},               // C-style contiguous strides
+                   sample_idx,                               // the data pointer
+                   free_when_done);                          // numpy array references
+}
+
+
+//#include <pybind11/pybind11.h>
+//#include <pybind11/numpy.h>
+//#include <vector>
+//#include <cassert>
+//#include <cmath>
+//
+//namespace py = pybind11;
+//
+//py::array build_sample_idx(const py::array_t<int32_t> &sizes_,
+//                                 const py::array_t<int32_t> &doc_idx_,
+//                                 const int32_t seq_length,
+//                                 const int32_t num_epochs,
+//                                 const int64_t tokens_per_epoch,
+//                                 const bool drop_last_partial_sequence = true,
+//                                 const int add_extra_token_to_sequence = 1)
+//{
+//    // Consistency checks.
+//    assert(seq_length > 1);
+//    assert(num_epochs > 0);
+//    assert(tokens_per_epoch > 1);
+//
+//    // Remove bound checks for efficiency.
+//    auto sizes = sizes_.unchecked<1>();
+//    auto doc_idx = doc_idx_.unchecked<1>();
+//
+//    // Calculate total number of documents per epoch.
+//    int64_t num_docs = doc_idx_.shape(0);
+//    int64_t total_docs = num_epochs * num_docs;
+//
+//    // Vector to hold sample indices temporarily.
+//    std::vector<int64_t> sample_idx_vector;
+//
+//    int64_t epoch = 0;
+//
+//    while (epoch < num_epochs)
+//    {
+//        int64_t doc_idx_index = 0; // Reset document index for each epoch.
+//
+//        while (doc_idx_index < num_docs)
+//        {
+//            int64_t current_sample_length = 0;
+//            int64_t start_doc_idx = doc_idx_index + epoch * num_docs;
+//            int64_t end_doc_idx = start_doc_idx;
+//
+//            // Accumulate documents until the sequence length is reached or exceeded.
+//            while (doc_idx_index < num_docs)
+//            {
+//                int64_t global_doc_idx = doc_idx_index + epoch * num_docs;
+//                auto doc_id = doc_idx[doc_idx_index % num_docs];
+//                auto doc_length = sizes[doc_id];
+//
+//                if (current_sample_length + doc_length <= seq_length)
+//                {
+//                    // Add document to current sample.
+//                    current_sample_length += doc_length;
+//                    ++doc_idx_index;
+//                    ++end_doc_idx;
+//                }
+//                else
+//                {
+//                    // Cannot add document without exceeding seq_length.
+//                    break;
+//                }
+//            }
+//
+//            // Record the sample if it meets the criteria.
+//            if (current_sample_length == seq_length || (!drop_last_partial_sequence && current_sample_length > 0))
+//            {
+//                // Append start and end document indices and sample length.
+//                sample_idx_vector.push_back(start_doc_idx);
+//                sample_idx_vector.push_back(end_doc_idx);
+//                sample_idx_vector.push_back(current_sample_length);
+//            }
+//
+//            // Handle case where no documents were added to the sample.
+//            if (start_doc_idx == end_doc_idx)
+//            {
+//                // Document is longer than seq_length; skip it.
+//                ++doc_idx_index;
+//            }
+//        }
+//
+//        // Move to the next epoch.
+//        ++epoch;
+//    }
+//
+//    // Determine the number of samples.
+//    int64_t num_samples = sample_idx_vector.size() / 3;
+//
+//    // Allocate memory for sample_idx using new[].
+//    int64_t *sample_idx = new int64_t[3 * num_samples];
+//
+//    // Copy data from vector to the allocated array.
+//    std::copy(sample_idx_vector.begin(), sample_idx_vector.end(), sample_idx);
+//
+//    // Method to deallocate memory using py::capsule.
+//    py::capsule free_when_done(sample_idx, [](void *mem_)
+//                               {
+//                                   int64_t *mem = reinterpret_cast<int64_t *>(mem_);
+//                                   delete[] mem;
+//                               });
+//
+//    // Define the shape and strides for the NumPy array.
+//    std::vector<int64_t> shape = {num_samples, 3};
+//    std::vector<int64_t> strides = {3 * sizeof(int64_t), sizeof(int64_t)};
+//
+//    // Return the NumPy array.
+//    return py::array(py::buffer_info(
+//        sample_idx,                                 // Pointer to data
+//        sizeof(int64_t),                            // Size of one scalar
+//        py::format_descriptor<int64_t>::format(),   // Python struct-style format descriptor
+//        2,                                          // Number of dimensions
+//        shape,                                      // Shape of the array
+//        strides,                                    // Strides (in bytes)
+//        free_when_done                              // Capsule to manage memory
+//    ));
+//}
+
 
 inline int32_t get_target_sample_len(const int32_t short_seq_ratio,
                                      const int32_t max_length,

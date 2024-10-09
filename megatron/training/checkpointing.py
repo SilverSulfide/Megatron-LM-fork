@@ -874,6 +874,11 @@ def _load_base_checkpoint(
         sys.modules.pop('megatron.model', None)
     except Exception as e:
         print('could not load the checkpoint')
+        print(checkpoint_name)
+        print(load_dir)
+        print(iteration)
+        print("rank0", rank0)
+        print("is_dist_ckpt", is_dist_ckpt)
         print(e)
         sys.exit()
 
@@ -952,7 +957,7 @@ def load_args_from_checkpoint(
     _set_arg('kv_channels')
     _set_arg('max_position_embeddings')
     _set_arg('position_embedding_type', force=True)
-    _set_arg('add_position_embedding', force=True)
+    _set_arg('add_position_embedding', force=False) # ghetto fix
     _set_arg('use_rotary_position_embeddings', force=True)
     _set_arg('rotary_percent', force=True)
     _set_arg('rotary_interleaved', force=True)
